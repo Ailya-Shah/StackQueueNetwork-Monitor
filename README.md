@@ -1,12 +1,14 @@
 # Advanced Network Monitor
 
-CS250 Assignment 2 - Network Monitor 
-Ailya Zainab, BSDS-2A, 523506 
+CS250 Assignment 2 
+# Network Monitor
+### Ailya Zainab, BSDS-2A, 523506 
+
 **Professional-Grade Real-Time Network Analysis System**
 
 ## Overview
 
-A high-performance, multi-threaded network monitoring system that demonstrates advanced data structure implementation and real-time packet processing. This implementation significantly surpasses basic requirements with production-ready architecture and professional features.
+A high-performance, multi-threaded network monitoring system that demonstrates advanced data structure implementation and real-time packet processing.
 
 
 ## Compilation & Execution
@@ -211,7 +213,7 @@ The system successfully demonstrates:
 - **Clean operation**: No memory leaks or resource issues
 
 ## 🔗 GitHub Repository
-[Your Repository Link Here]
+https://github.com/Ailya-Shah/StackQueueNetwork-Monitor
 
 ---
 
