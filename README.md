@@ -28,9 +28,6 @@ g++ -std=c++17 -o network_monitor network_monitor.cpp -pthread
 # Default interface (eth0)
 sudo ./network_monitor
 
-# Specific interface
-sudo ./network_monitor wlan0
-
 # Loopback testing
 sudo ./network_monitor lo
 ```
