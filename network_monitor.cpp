@@ -13,7 +13,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <algorithm>  // Added for reverse function
+#include <algorithm>
 #include <ctime>
 #include <mutex>
 #include <condition_variable>
@@ -41,6 +41,7 @@ static const int REPLAY_SIZE_THRESHOLD = 1500;
 static const int MAX_REPLAY_RETRIES = 2;
 static const int DEMO_RUNTIME_SECONDS = 60;
 static const int OVERSIZED_PACKET_LIMIT = 10;
+static const int DISSECTION_SAMPLE_SIZE = 5;  // Number of packets to save for dissection demo
 
 // -------------------------------
 // Utility Functions
@@ -49,7 +50,10 @@ string getCurrentTimestamp() {
     auto now = chrono::system_clock::now();
     time_t time = chrono::system_clock::to_time_t(now);
     char buffer[64];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", localtime(&time));
+    // localtime_r is thread-safe (unlike localtime which uses a static buffer)
+    struct tm tm_result;
+    localtime_r(&time, &tm_result);
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_result);
     return string(buffer);
 }
 
@@ -77,9 +81,9 @@ struct Packet {
     string destinationIP;
     int replayAttempts;
 
-    Packet() : id(0), timestamp(), rawData(nullptr), size(0), 
+    Packet() : id(0), timestamp(), rawData(nullptr), size(0),
                sourceIP(), destinationIP(), replayAttempts(0) {}
-    
+
     // Deep copy constructor
     Packet(const Packet &other) {
         id = other.id;
@@ -88,7 +92,7 @@ struct Packet {
         sourceIP = other.sourceIP;
         destinationIP = other.destinationIP;
         replayAttempts = other.replayAttempts;
-        
+
         if (size > 0 && other.rawData) {
             rawData = (uint8_t*)malloc(size);
             memcpy(rawData, other.rawData, size);
@@ -96,19 +100,19 @@ struct Packet {
             rawData = nullptr;
         }
     }
-    
+
     Packet& operator=(const Packet &other) {
         if (this == &other) return *this;
-        
+
         if (rawData) free(rawData);
-        
+
         id = other.id;
         timestamp = other.timestamp;
         size = other.size;
         sourceIP = other.sourceIP;
         destinationIP = other.destinationIP;
         replayAttempts = other.replayAttempts;
-        
+
         if (size > 0 && other.rawData) {
             rawData = (uint8_t*)malloc(size);
             memcpy(rawData, other.rawData, size);
@@ -117,7 +121,7 @@ struct Packet {
         }
         return *this;
     }
-    
+
     ~Packet() {
         if (rawData) free(rawData);
     }
@@ -133,7 +137,7 @@ private:
         Node* next;
         Node(const Packet &pkt) : packet(pkt), next(nullptr) {}
     };
-    
+
     Node* head;
     Node* tail;
     int elementCount;
@@ -142,7 +146,7 @@ private:
 
 public:
     PacketQueue() : head(nullptr), tail(nullptr), elementCount(0) {}
-    
+
     ~PacketQueue() {
         clear();
     }
@@ -150,14 +154,14 @@ public:
     void enqueue(const Packet &packet) {
         Node* newNode = new Node(packet);
         unique_lock<mutex> lock(queueMutex);
-        
+
         if (!tail) {
             head = tail = newNode;
         } else {
             tail->next = newNode;
             tail = newNode;
         }
-        
+
         ++elementCount;
         lock.unlock();
         conditionVar.notify_one();
@@ -166,13 +170,13 @@ public:
     bool dequeue(Packet &output) {
         unique_lock<mutex> lock(queueMutex);
         if (!head) return false;
-        
+
         Node* nodeToRemove = head;
         output = nodeToRemove->packet;
         head = head->next;
-        
+
         if (!head) tail = nullptr;
-        
+
         --elementCount;
         lock.unlock();
         delete nodeToRemove;
@@ -181,18 +185,18 @@ public:
 
     bool dequeueWithTimeout(Packet &output, int timeoutMs) {
         unique_lock<mutex> lock(queueMutex);
-        
-        if (!conditionVar.wait_for(lock, chrono::milliseconds(timeoutMs), 
+
+        if (!conditionVar.wait_for(lock, chrono::milliseconds(timeoutMs),
                                   [&]{ return head != nullptr; })) {
             return false;
         }
-        
+
         Node* nodeToRemove = head;
         output = nodeToRemove->packet;
         head = head->next;
-        
+
         if (!head) tail = nullptr;
-        
+
         --elementCount;
         lock.unlock();
         delete nodeToRemove;
@@ -202,7 +206,7 @@ public:
     bool peek(Packet &output) {
         unique_lock<mutex> lock(queueMutex);
         if (!head) return false;
-        
+
         output = head->packet;
         return true;
     }
@@ -234,12 +238,12 @@ private:
         Node* next;
         Node(const string &layer) : layerName(layer), next(nullptr) {}
     };
-    
+
     Node* topNode;
 
 public:
     LayerStack() : topNode(nullptr) {}
-    
+
     ~LayerStack() {
         while (topNode) {
             Node* temp = topNode;
@@ -247,26 +251,26 @@ public:
             delete temp;
         }
     }
-    
+
     void push(const string &layer) {
         Node* newNode = new Node(layer);
         newNode->next = topNode;
         topNode = newNode;
     }
-    
+
     bool pop() {
         if (!topNode) return false;
-        
+
         Node* temp = topNode;
         topNode = topNode->next;
         delete temp;
         return true;
     }
-    
+
     string getTop() {
         return topNode ? topNode->layerName : string();
     }
-    
+
     bool isEmpty() {
         return topNode == nullptr;
     }
@@ -274,12 +278,12 @@ public:
     vector<string> toVector() const {
         vector<string> layers;
         Node* current = topNode;
-        
+
         while (current) {
             layers.push_back(current->layerName);
             current = current->next;
         }
-        
+
         // Reverse to get bottom-to-top order
         reverse(layers.begin(), layers.end());
         return layers;
@@ -293,16 +297,16 @@ class PacketDissector {
 public:
     static void dissect(const Packet &packet, LayerStack &stack, vector<string> &outputLayers) {
         if (packet.size <= 0 || packet.rawData == nullptr) return;
-        
+
         // Parse Ethernet layer
         if (packet.size < (ssize_t)sizeof(ether_header)) {
             outputLayers.push_back("Truncated/Ethernet");
             return;
         }
-        
+
         stack.push("Ethernet");
         outputLayers.push_back("Ethernet");
-        
+
         const ether_header *ethernetHeader = reinterpret_cast<const ether_header*>(packet.rawData);
         uint16_t etherType = ntohs(ethernetHeader->ether_type);
         size_t currentOffset = sizeof(ether_header);
@@ -313,17 +317,17 @@ public:
                 outputLayers.push_back("Truncated/IPv6");
                 return;
             }
-            
+
             stack.push("IPv6");
             outputLayers.push_back("IPv6");
-            
+
             const struct ip6_hdr *ipv6Header = reinterpret_cast<const struct ip6_hdr*>(
                 packet.rawData + currentOffset);
             currentOffset += sizeof(struct ip6_hdr);
-            
+
             outputLayers.push_back("SourceIPv6:" + convertIPv6ToString(ipv6Header->ip6_src));
             outputLayers.push_back("DestinationIPv6:" + convertIPv6ToString(ipv6Header->ip6_dst));
-            
+
             int nextHeader = ipv6Header->ip6_nxt;
             if (nextHeader == IPPROTO_TCP) {
                 parseTCP(packet, currentOffset, stack, outputLayers);
@@ -337,25 +341,25 @@ public:
                 outputLayers.push_back("Truncated/IPv4");
                 return;
             }
-            
+
             stack.push("IPv4");
             outputLayers.push_back("IPv4");
-            
+
             const struct ip *ipv4Header = reinterpret_cast<const struct ip*>(
                 packet.rawData + currentOffset);
             int ipHeaderLength = ipv4Header->ip_hl * 4;
             int protocol = ipv4Header->ip_p;
-            
+
             if (packet.size < (ssize_t)(currentOffset + ipHeaderLength)) {
                 outputLayers.push_back("Truncated/IPv4-header");
                 return;
             }
-            
+
             outputLayers.push_back("SourceIPv4:" + convertIPv4ToString(ipv4Header->ip_src.s_addr));
             outputLayers.push_back("DestinationIPv4:" + convertIPv4ToString(ipv4Header->ip_dst.s_addr));
-            
+
             currentOffset += ipHeaderLength;
-            
+
             if (protocol == IPPROTO_TCP) {
                 parseTCP(packet, currentOffset, stack, outputLayers);
             } else if (protocol == IPPROTO_UDP) {
@@ -371,10 +375,10 @@ private:
         if (packet.size >= (ssize_t)(offset + sizeof(struct tcphdr))) {
             stack.push("TCP");
             outputLayers.push_back("TCP");
-            
+
             const struct tcphdr *tcpHeader = reinterpret_cast<const struct tcphdr*>(
                 packet.rawData + offset);
-            
+
             outputLayers.push_back("SourcePort:" + to_string(ntohs(tcpHeader->th_sport)));
             outputLayers.push_back("DestinationPort:" + to_string(ntohs(tcpHeader->th_dport)));
         } else {
@@ -386,10 +390,10 @@ private:
         if (packet.size >= (ssize_t)(offset + sizeof(struct udphdr))) {
             stack.push("UDP");
             outputLayers.push_back("UDP");
-            
+
             const struct udphdr *udpHeader = reinterpret_cast<const struct udphdr*>(
                 packet.rawData + offset);
-            
+
             outputLayers.push_back("SourcePort:" + to_string(ntohs(udpHeader->uh_sport)));
             outputLayers.push_back("DestinationPort:" + to_string(ntohs(udpHeader->uh_dport)));
         } else {
@@ -410,9 +414,14 @@ private:
     atomic<int> packetIdCounter;
     thread captureThread;
 
+    // Sample queue for dissection demo — collects first N packets independently
+    // of the main pipeline so the demo always has something to show
+    mutex sampleMutex;
+    vector<Packet> dissectionSamples;
+
 public:
-    CaptureManager(PacketQueue &queue, const string &interface) 
-        : socketDescriptor(-1), networkInterface(interface), isRunning(false), 
+    CaptureManager(PacketQueue &queue, const string &interface)
+        : socketDescriptor(-1), networkInterface(interface), isRunning(false),
           packetQueue(queue), packetIdCounter(1) {}
 
     bool initializeSocket() {
@@ -421,21 +430,21 @@ public:
             cerr << "[Capture] Failed to create raw socket: " << strerror(errno) << endl;
             return false;
         }
-        
+
         // Bind to specified network interface
         struct sockaddr_ll socketAddress;
         memset(&socketAddress, 0, sizeof(socketAddress));
         socketAddress.sll_family = AF_PACKET;
         socketAddress.sll_ifindex = if_nametoindex(networkInterface.c_str());
-        
+
         if (socketAddress.sll_ifindex == 0) {
             cerr << "[Capture] Interface not found: " << networkInterface << endl;
             close(socketDescriptor);
             return false;
         }
-        
+
         socketAddress.sll_protocol = htons(ETH_P_ALL);
-        
+
         if (bind(socketDescriptor, (struct sockaddr*)&socketAddress, sizeof(socketAddress)) < 0) {
             cerr << "[Capture] Bind failed: " << strerror(errno) << endl;
             close(socketDescriptor);
@@ -447,7 +456,7 @@ public:
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
         setsockopt(socketDescriptor, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-        
+
         return true;
     }
 
@@ -455,23 +464,29 @@ public:
         isRunning = true;
         captureThread = thread([this](){ this->captureLoop(); });
     }
-    
+
     void stopCapture() {
         isRunning = false;
         if (socketDescriptor >= 0) close(socketDescriptor);
         if (captureThread.joinable()) captureThread.join();
     }
 
+    // Called after stopCapture() — safe to read without lock
+    vector<Packet> getDissectionSamples() {
+        lock_guard<mutex> lock(sampleMutex);
+        return dissectionSamples;
+    }
+
 private:
     void captureLoop() {
-        cout << "[Capture] Starting capture on interface: " << networkInterface 
+        cout << "[Capture] Starting capture on interface: " << networkInterface
              << " at " << getCurrentTimestamp() << endl;
-        
+
         uint8_t *buffer = (uint8_t*)malloc(MAX_PACKET_SIZE);
-        
+
         while (isRunning) {
             ssize_t packetLength = recvfrom(socketDescriptor, buffer, MAX_PACKET_SIZE, 0, nullptr, nullptr);
-            
+
             if (packetLength < 0) {
                 if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) {
                     continue; // Timeout or signal, check running status
@@ -479,7 +494,7 @@ private:
                 cerr << "[Capture] Receive error: " << strerror(errno) << endl;
                 break;
             }
-            
+
             // Create and store packet
             Packet newPacket;
             newPacket.id = packetIdCounter++;
@@ -490,22 +505,33 @@ private:
             newPacket.replayAttempts = 0;
 
             extractIPAddresses(newPacket);
+
+            // Save a copy of early packets for end-of-run dissection demo.
+            // This must happen before enqueue() since the pipeline may consume
+            // the packet before we get a chance to read it back out.
+            {
+                lock_guard<mutex> lock(sampleMutex);
+                if ((int)dissectionSamples.size() < DISSECTION_SAMPLE_SIZE) {
+                    dissectionSamples.push_back(newPacket);
+                }
+            }
+
             packetQueue.enqueue(newPacket);
-            
+
             this_thread::sleep_for(chrono::milliseconds(1));
         }
-        
+
         free(buffer);
         cout << "[Capture] Capture loop terminated" << endl;
     }
 
     void extractIPAddresses(Packet &packet) {
         if (packet.size < (ssize_t)sizeof(ether_header)) return;
-        
+
         const ether_header *ethernetHeader = reinterpret_cast<const ether_header*>(packet.rawData);
         uint16_t etherType = ntohs(ethernetHeader->ether_type);
         size_t offset = sizeof(ether_header);
-        
+
         if (etherType == ETHERTYPE_IP && packet.size >= (ssize_t)(offset + sizeof(struct ip))) {
             const struct ip *ipv4Header = reinterpret_cast<const struct ip*>(packet.rawData + offset);
             packet.sourceIP = convertIPv4ToString(ipv4Header->ip_src.s_addr);
@@ -532,7 +558,7 @@ private:
 
 public:
     NetworkReplayer(PacketQueue &replayQ, PacketQueue &backupQ, const string &interface)
-        : replayQueue(replayQ), backupQueue(backupQ), networkInterface(interface), 
+        : replayQueue(replayQ), backupQueue(backupQ), networkInterface(interface),
           isRunning(false), outputSocket(-1) {}
 
     bool initializeOutputSocket() {
@@ -541,26 +567,26 @@ public:
             cerr << "[Replayer] Failed to create output socket: " << strerror(errno) << endl;
             return false;
         }
-        
+
         struct sockaddr_ll socketAddress;
         memset(&socketAddress, 0, sizeof(socketAddress));
         socketAddress.sll_family = AF_PACKET;
         socketAddress.sll_ifindex = if_nametoindex(networkInterface.c_str());
-        
+
         if (socketAddress.sll_ifindex == 0) {
             cerr << "[Replayer] Interface not found: " << networkInterface << endl;
             close(outputSocket);
             return false;
         }
-        
+
         socketAddress.sll_protocol = htons(ETH_P_ALL);
-        
+
         if (bind(outputSocket, (struct sockaddr*)&socketAddress, sizeof(socketAddress)) < 0) {
             cerr << "[Replayer] Bind failed: " << strerror(errno) << endl;
             close(outputSocket);
             return false;
         }
-        
+
         return true;
     }
 
@@ -568,7 +594,7 @@ public:
         isRunning = true;
         replayThread = thread([this](){ this->replayLoop(); });
     }
-    
+
     void stopReplay() {
         isRunning = false;
         if (outputSocket >= 0) close(outputSocket);
@@ -578,22 +604,22 @@ public:
 private:
     void replayLoop() {
         cout << "[Replayer] Starting replay on " << networkInterface << endl;
-        
+
         while (isRunning) {
             Packet packet;
             if (!replayQueue.dequeueWithTimeout(packet, 500)) {
                 continue;
             }
-            
+
             bool sentSuccessfully = sendPacket(packet);
-            
+
             if (!sentSuccessfully) {
                 packet.replayAttempts++;
                 backupQueue.enqueue(packet);
-                cout << "[Replayer] Packet " << packet.id << " moved to backup (attempt " 
+                cout << "[Replayer] Packet " << packet.id << " moved to backup (attempt "
                      << packet.replayAttempts << ")" << endl;
             } else {
-                cout << "[Replayer] Packet " << packet.id << " replayed successfully (size=" 
+                cout << "[Replayer] Packet " << packet.id << " replayed successfully (size="
                      << packet.size << ")" << endl;
             }
 
@@ -603,28 +629,28 @@ private:
 
             processBackupQueue();
         }
-        
+
         cout << "[Replayer] Replay loop terminated" << endl;
     }
 
     bool sendPacket(const Packet &packet) {
         if (outputSocket < 0) return false;
-        
+
         struct sockaddr_ll destination;
         memset(&destination, 0, sizeof(destination));
         destination.sll_family = AF_PACKET;
         destination.sll_ifindex = if_nametoindex(networkInterface.c_str());
         destination.sll_halen = ETH_ALEN;
-        
-        ssize_t bytesSent = sendto(outputSocket, packet.rawData, packet.size, 0, 
+
+        ssize_t bytesSent = sendto(outputSocket, packet.rawData, packet.size, 0,
                                  (struct sockaddr*)&destination, sizeof(destination));
-        
+
         if (bytesSent < 0) {
-            cerr << "[Replayer] Send failed for packet " << packet.id << ": " 
+            cerr << "[Replayer] Send failed for packet " << packet.id << ": "
                  << strerror(errno) << endl;
             return false;
         }
-        
+
         return bytesSent == packet.size;
     }
 
@@ -633,20 +659,20 @@ private:
         if (backupQueue.dequeue(backupPacket)) {
             if (backupPacket.replayAttempts <= MAX_REPLAY_RETRIES) {
                 bool retrySuccess = sendPacket(backupPacket);
-                
+
                 if (!retrySuccess) {
                     backupPacket.replayAttempts++;
-                    
+
                     if (backupPacket.replayAttempts > MAX_REPLAY_RETRIES) {
-                        cout << "[Replayer] Packet " << backupPacket.id 
+                        cout << "[Replayer] Packet " << backupPacket.id
                              << " exceeded maximum retries, dropping" << endl;
                     } else {
                         backupQueue.enqueue(backupPacket);
-                        cout << "[Replayer] Retry queued for Packet " << backupPacket.id 
+                        cout << "[Replayer] Retry queued for Packet " << backupPacket.id
                              << " (attempt " << backupPacket.replayAttempts << ")" << endl;
                     }
                 } else {
-                    cout << "[Replayer] Backup Packet " << backupPacket.id 
+                    cout << "[Replayer] Backup Packet " << backupPacket.id
                          << " replayed successfully on retry" << endl;
                 }
             }
@@ -664,14 +690,14 @@ private:
     atomic<bool> isRunning;
     string sourceFilter;
     string destinationFilter;
-    int oversizedPacketCount;
+    int totalOversizedPackets;  // Total count across the run (never resets)
     int oversizedPacketLimit;
     thread filterThread;
 
 public:
     FilterManager(PacketQueue &captureQ, PacketQueue &replayQ)
-        : captureQueue(captureQ), replayQueue(replayQ), isRunning(false), 
-          oversizedPacketCount(0), oversizedPacketLimit(OVERSIZED_PACKET_LIMIT) {}
+        : captureQueue(captureQ), replayQueue(replayQ), isRunning(false),
+          totalOversizedPackets(0), oversizedPacketLimit(OVERSIZED_PACKET_LIMIT) {}
 
     void setFilters(const string &source, const string &destination) {
         sourceFilter = source;
@@ -682,7 +708,7 @@ public:
         isRunning = true;
         filterThread = thread([this](){ this->filterLoop(); });
     }
-    
+
     void stopFiltering() {
         isRunning = false;
         if (filterThread.joinable()) filterThread.join();
@@ -690,35 +716,36 @@ public:
 
 private:
     void filterLoop() {
-        cout << "[Filter] Starting filter loop. Source=" 
+        cout << "[Filter] Starting filter loop. Source="
              << (sourceFilter.empty() ? "<any>" : sourceFilter)
              << " Destination=" << (destinationFilter.empty() ? "<any>" : destinationFilter) << endl;
-        
+
         while (isRunning) {
             Packet packet;
             if (!captureQueue.dequeueWithTimeout(packet, 200)) {
                 continue;
             }
-            
+
             if (packet.size > REPLAY_SIZE_THRESHOLD) {
-                oversizedPacketCount++;
-                if (oversizedPacketCount > oversizedPacketLimit) {
-                    cout << "[Filter] Skipping oversized packet " << packet.id 
-                         << " (size=" << packet.size << ")" << endl;
+                totalOversizedPackets++;
+                if (totalOversizedPackets > oversizedPacketLimit) {
+                    cout << "[Filter] Skipping oversized packet " << packet.id
+                         << " (size=" << packet.size << ", total oversized=" 
+                         << totalOversizedPackets << ")" << endl;
                     continue;
                 }
             }
-            
+
             if (matchesFilter(packet)) {
                 replayQueue.enqueue(packet);
                 double delay = (double)packet.size / 1000.0;
-                cout << "[Filter] Packet " << packet.id << " matched filters. Delay=" 
+                cout << "[Filter] Packet " << packet.id << " matched filters. Delay="
                      << fixed << setprecision(3) << delay << " ms" << endl;
             }
-            
+
             this_thread::sleep_for(chrono::milliseconds(1));
         }
-        
+
         cout << "[Filter] Filter loop terminated" << endl;
     }
 
@@ -732,28 +759,31 @@ private:
 // -------------------------------
 // Display Functions
 // -------------------------------
-void displayQueueStatus(PacketQueue &queue) {
-    cout << "[Display] Current queue size: " << queue.getSize() << endl;
+void displayQueueStatus(const string &name, PacketQueue &queue) {
+    cout << "[Display] " << name << " queue size: " << queue.getSize() << endl;
 }
 
-void demonstratePacketDissection(PacketQueue &queue, int maxPackets) {
-    cout << "[Demo] Dissecting " << maxPackets << " packets:" << endl;
-    
-    for (int i = 0; i < maxPackets; i++) {
-        Packet packet;
-        if (!queue.dequeue(packet)) break;
-        
-        cout << "Packet ID=" << packet.id << " Time=" << packet.timestamp 
-             << " Size=" << packet.size << " Source=" << packet.sourceIP 
+void demonstratePacketDissection(const vector<Packet> &samples) {
+    if (samples.empty()) {
+        cout << "[Demo] No packets available for dissection demo." << endl;
+        return;
+    }
+
+    cout << "[Demo] Dissecting " << samples.size() << " captured packets:" << endl;
+
+    for (const Packet &packet : samples) {
+        cout << "  Packet ID=" << packet.id << " Time=" << packet.timestamp
+             << " Size=" << packet.size << " Source=" << packet.sourceIP
              << " Destination=" << packet.destinationIP << endl;
-        
+
         LayerStack layerStack;
         vector<string> layers;
         PacketDissector::dissect(packet, layerStack, layers);
-        
-        cout << "  Layers: ";
-        for (auto &layer : layers) {
-            cout << layer << " | ";
+
+        cout << "    Layers: ";
+        for (size_t i = 0; i < layers.size(); i++) {
+            cout << layers[i];
+            if (i + 1 < layers.size()) cout << " | ";
         }
         cout << endl;
     }
@@ -768,7 +798,7 @@ int main(int argc, char** argv) {
         cerr << "Error: This program requires root privileges. Use: sudo ./network_monitor" << endl;
         return 1;
     }
-    
+
     string networkInterface = (argc > 1) ? string(argv[1]) : "eth0";
     cout << "Network Monitor Starting - Interface: " << networkInterface << endl;
 
@@ -793,14 +823,14 @@ int main(int argc, char** argv) {
 
     // Initialize filter manager
     FilterManager filterManager(captureQueue, replayQueue);
-    
+
     // Get filter criteria from user
     string sourceFilter, destinationFilter;
     cout << "Enter source IP filter (empty for any): ";
     getline(cin, sourceFilter);
     cout << "Enter destination IP filter (empty for any): ";
     getline(cin, destinationFilter);
-    
+
     filterManager.setFilters(sourceFilter, destinationFilter);
 
     // Start all services
@@ -824,14 +854,17 @@ int main(int argc, char** argv) {
     filterManager.stopFiltering();
     networkReplayer.stopReplay();
 
-    // Display results
-    cout << "[Demo] Final Statistics:" << endl;
-    displayQueueStatus(captureQueue);
-    displayQueueStatus(replayQueue);
-    displayQueueStatus(backupQueue);
+    // Display final queue states
+    cout << "[Demo] Final Queue Statistics:" << endl;
+    displayQueueStatus("Capture", captureQueue);
+    displayQueueStatus("Replay",  replayQueue);
+    displayQueueStatus("Backup",  backupQueue);
 
-    // Demonstrate packet dissection
-    demonstratePacketDissection(captureQueue, 5);
+    // Demonstrate packet dissection using samples collected during capture.
+    // The dissection samples are saved independently of the pipeline, so they
+    // are always available here regardless of how many packets were filtered
+    // or replayed.
+    demonstratePacketDissection(captureManager.getDissectionSamples());
 
     cout << "[Demo] Network Monitor demonstration completed successfully" << endl;
     return 0;
