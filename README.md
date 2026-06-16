@@ -1,15 +1,10 @@
-# Advanced Network Monitor
-
-CS250 Assignment 2 
 # Network Monitor
-### Ailya Zainab, BSDS-2A, 523506 
+### CS250 Assignment 2
+### Ailya Zainab, BSDS-2A, 523506
 
-**Professional-Grade Real-Time Network Analysis System**
+A multi-threaded network monitoring system demonstrating custom stack and queue data structures applied to real-time packet capture, protocol dissection, filtering, and replay.
 
-## Overview
-
-A high-performance, multi-threaded network monitoring system that demonstrates advanced data structure implementation and real-time packet processing.
-
+---
 
 ## Compilation & Execution
 
@@ -32,84 +27,112 @@ sudo ./network_monitor
 sudo ./network_monitor lo
 ```
 
+---
+
 ## System Architecture
 
 ### Multi-Threaded Pipeline
 ```
 [Capture Thread] → [Capture Queue] → [Filter Thread] → [Replay Queue] → [Replay Thread]
-                                      ↓
-                                [Backup Queue] (Retry Mechanism)
+                         ↓                                                      ↓
+                  [Dissection Samples]                                  [Backup Queue]
+                  (first 5 packets saved                                (retry mechanism,
+                   independently for demo)                               up to 2 retries)
 ```
 
 ### Core Components
 
-#### 1. **Custom Thread-Safe Queue**
+#### 1. Custom Thread-Safe Queue (`PacketQueue`)
 ```cpp
 class PacketQueue {
-    // Lock-free operations with mutex & condition variables
+    // Thread-safe operations via mutex & condition variables
     void enqueue(const Packet &packet);
     bool dequeueWithTimeout(Packet &output, int timeoutMs);
-    // Thread-safe size monitoring
+    bool dequeue(Packet &output);
+    int getSize();
 };
 ```
+Implemented as a linked-list FIFO. A `mutex` protects all structural modifications; a `condition_variable` allows the consumer thread to block efficiently rather than spin. Unlock-before-notify is used to avoid waking a thread that immediately blocks again on the mutex.
 
-#### 2. **Protocol Layer Stack**
+#### 2. Protocol Layer Stack (`LayerStack`)
 ```cpp
 class LayerStack {
-    // LIFO structure for protocol parsing
+    // LIFO structure for protocol layer tracking
     void push(const string &layer);
-    vector<string> toVector(); // Bottom-to-top order
+    bool pop();
+    vector<string> toVector(); // Returns layers in bottom-to-top order
 };
 ```
+A linked-list stack. Protocol layers are pushed in order of parsing (Ethernet → IP → TCP/UDP); `toVector()` reverses them to present the logical bottom-to-top stack order. LIFO is the natural fit here: the last layer pushed is the first to be unwound when dissection is complete.
 
-#### 3. **Intelligent Packet Management**
+#### 3. Packet Structure
 ```cpp
 struct Packet {
-    int id;                    // Unique identifier
-    string timestamp;          // High-resolution timing
-    uint8_t *rawData;          // Deep-copied packet buffer
-    string sourceIP;           // Pre-parsed addresses
-    string destinationIP;      // For fast filtering
-    int replayAttempts;        // Retry tracking
+    int id;                 // Unique identifier
+    string timestamp;       // Capture time (thread-safe via localtime_r)
+    uint8_t *rawData;       // Owning pointer — deep copied on assignment
+    ssize_t size;
+    string sourceIP;
+    string destinationIP;
+    int replayAttempts;     // Retry counter for backup queue
 };
 ```
+Implements a copy constructor and copy-assignment operator to manage the `rawData` heap buffer. The destructor calls `free(rawData)`, following RAII.
 
-## Advanced Features
+---
 
-### Real-Time Packet Processing
-- **Continuous capture** during 60-second demo
-- **Live filtering** with user-defined IP rules
-- **Dynamic delay calculation**: `packet_size / 1000 ms`
-- **Oversized packet management** with configurable thresholds
+## Features
 
-### Professional Error Handling
+### Real-Time Packet Capture
+- Raw `AF_PACKET` socket bound to a user-specified interface
+- Captures all EtherTypes (Ethernet, IPv4, IPv6)
+- 1-second socket receive timeout allows clean shutdown without blocking
+
+### Protocol Dissection (`PacketDissector`)
+- Ethernet → IPv4/IPv6 → TCP/UDP, layer by layer
+- Bounds-checked at every header boundary; truncated packets are labelled rather than crashed on
+- Source/destination IP and port extracted and stored per packet
+
+### IP Filtering (`FilterManager`)
+- User-supplied source and/or destination IP filters
+- Empty filter string matches any address
+- Oversized packets (> 1500 bytes) are counted; after `OVERSIZED_PACKET_LIMIT` total oversized packets, further oversized packets are skipped with a log message
+
+### Replay with Retry (`NetworkReplayer`)
+- Filtered packets replayed onto the same interface via a second raw socket
+- Failed sends moved to a backup queue
+- Up to `MAX_REPLAY_RETRIES` (2) retry attempts per packet; packets exceeding the limit are dropped with a log message
+- Per-packet replay delay simulated as `packet_size / 1000` ms
+
+### Dissection Demo
+- The first `DISSECTION_SAMPLE_SIZE` (5) packets are saved during capture, independently of the filter/replay pipeline
+- Dissection output is printed after shutdown and always has packets to show, regardless of filter settings
+
+---
+
+## Configuration Constants
+
 ```cpp
-// Automatic retry system with backup queue
-if (!sendPacket(packet)) {
-    packet.replayAttempts++;
-    if (packet.replayAttempts <= MAX_REPLAY_RETRIES) {
-        backupQueue.enqueue(packet); // Queue for retry
-    } else {
-        // Permanent failure handling
-    }
-}
+static const int MAX_PACKET_SIZE       = 65536;  // Receive buffer size
+static const int REPLAY_SIZE_THRESHOLD = 1500;   // Oversized packet threshold (bytes)
+static const int MAX_REPLAY_RETRIES    = 2;       // Retry limit per failed packet
+static const int DEMO_RUNTIME_SECONDS  = 60;      // Demo duration
+static const int OVERSIZED_PACKET_LIMIT = 10;    // Total oversized packets before skipping
+static const int DISSECTION_SAMPLE_SIZE = 5;     // Packets saved for end-of-run demo
 ```
 
-### Complete Protocol Support
-- **Ethernet**: MAC addresses, EtherType detection
-- **IPv4**: Address parsing, header length calculation
-- **IPv6**: Extended address support, next header protocol
-- **TCP**: Port numbers, sequence analysis
-- **UDP**: Port mapping, length validation
+---
 
-## Performance Metrics
+## Data Structure Justification
 
-**Demonstrated Capability:**
--  **379+ packets** processed in 60 seconds
--  **Zero packet loss** in normal operation
--  **Real-time throughput** with varied packet sizes
--  **Consistent delay simulation** based on packet size
--  **Clean shutdown** with proper resource cleanup
+| Structure | Class | Why |
+|---|---|---|
+| Linked-list FIFO queue | `PacketQueue` | Packets arrive and are consumed in order; O(1) enqueue and dequeue; no fixed-size limit |
+| Linked-list LIFO stack | `LayerStack` | Protocol layers are parsed outermost-first and naturally unwound in reverse; LIFO matches the encapsulation model |
+
+Three queues are used: `captureQueue` (producer: capture thread; consumer: filter thread), `replayQueue` (producer: filter thread; consumer: replay thread), and `backupQueue` (producer/consumer: replay thread for retry handling).
+
+---
 
 ## Usage Example
 
@@ -117,100 +140,75 @@ if (!sendPacket(packet)) {
 $ sudo ./network_monitor eth0
 Network Monitor Starting - Interface: eth0
 Enter source IP filter (empty for any): 192.168.1.100
-Enter destination IP filter (empty for any): 
+Enter destination IP filter (empty for any):
 
 [Demo] Starting all services...
 [Capture] Starting capture on interface: eth0 at 2024-01-15 14:30:22
 [Filter] Starting filter loop. Source=192.168.1.100 Destination=<any>
 [Replayer] Starting replay on eth0
 
-# Real-time output during operation:
-[Filter] Packet 39617 matched filters. Delay=0.090 ms
-[Replayer] Packet 39617 replayed successfully (size=90)
-[Filter] Packet 39618 matched filters. Delay=0.054 ms
-[Replayer] Packet 39618 replayed successfully (size=54)
+[Filter] Packet 3 matched filters. Delay=0.090 ms
+[Replayer] Packet 3 replayed successfully (size=90)
+[Filter] Packet 7 matched filters. Delay=0.054 ms
+[Replayer] Packet 7 replayed successfully (size=54)
+...
+[Demo] 50 seconds remaining...
+[Demo] 40 seconds remaining...
+...
+[Demo] Stopping services...
+[Demo] Final Queue Statistics:
+[Display] Capture queue size: 0
+[Display] Replay queue size: 0
+[Display] Backup queue size: 0
 
-[Demo] Final Statistics:
-[Display] Current queue size: 0
-[Display] Current queue size: 0  
-[Display] Current queue size: 0
+[Demo] Dissecting 5 captured packets:
+  Packet ID=1 Time=2024-01-15 14:30:22 Size=90 Source=192.168.1.100 Destination=142.250.80.46
+    Layers: Ethernet | IPv4 | SourceIPv4:192.168.1.100 | DestinationIPv4:142.250.80.46 | TCP | SourcePort:52341 | DestinationPort:80
+  ...
 [Demo] Network Monitor demonstration completed successfully
 ```
 
-## Testing & Validation
+---
 
-### Generate Test Traffic
+## Generating Test Traffic
+
 ```bash
-# ICMP packets
+# ICMP
 ping google.com -c 50
 
-# TCP traffic
+# TCP
 curl http://example.com
 
-# UDP traffic
+# UDP
 nping --udp -p 53 8.8.8.8
 ```
 
 ### Interface Discovery
 ```bash
-ip link show              # List available interfaces
-ifconfig                  # Traditional interface listing
+ip link show      # List available interfaces
+ifconfig          # Traditional listing
 ```
-
-## 📋 Configuration Constants
-
-```cpp
-static const int MAX_PACKET_SIZE = 65536;        // Maximum packet buffer
-static const int REPLAY_SIZE_THRESHOLD = 1500;   // Oversized packet threshold  
-static const int MAX_REPLAY_RETRIES = 2;         // Retry limit per packet
-static const int DEMO_RUNTIME_SECONDS = 60;      // Required demo duration
-static const int OVERSIZED_PACKET_LIMIT = 10;    // Consecutive oversized limit
-```
-
-### Data Structure Implementation
-- **Custom Queue**: Thread-safe FIFO with linked list
-- **Custom Stack**: LIFO protocol parsing structure
-- **Memory Management**: Deep copy semantics, RAII principles
-
-### Algorithm Application
-- **Protocol Parsing**: Layer-by-layer stack-based dissection
-- **Filtering Algorithms**: IP-based matching with performance optimization
-- **Scheduling**: Packet delay simulation based on size
-
-### System Design
-- **Producer-Consumer Pattern**: Multi-threaded pipeline
-- **Error Recovery**: Backup queues with retry limits
-- **Resource Management**: Proper socket and memory cleanup
-
-## Important Notes
-
-### Root Privileges Required
-```bash
-# Raw socket access needs elevated permissions
-sudo ./network_monitor
-```
-
-### Interface Selection
-- Default: `eth0` (Ethernet)
-- Alternatives: `wlan0` (WiFi), `lo` (loopback)
-- Use `ip link show` to discover available interfaces
-
-### Performance Considerations
-- System handles high packet rates efficiently
-- Memory usage optimized with proper buffer management
-- Thread synchronization prevents data races
-
-## 📈 Sample Output Analysis
-
-The system successfully demonstrates:
-- **High throughput**: 379+ packets in 60 seconds
-- **Accurate filtering**: All packets matched user criteria
-- **Proper timing**: Delay calculations match packet sizes
-- **Zero failures**: All packets replayed successfully
-- **Clean operation**: No memory leaks or resource issues
-
-## 🔗 GitHub Repository
-https://github.com/Ailya-Shah/StackQueueNetwork-Monitor
 
 ---
 
+## Thread Safety Notes
+
+- `PacketQueue` uses a `std::mutex` and `std::condition_variable`; all queue operations acquire the lock before touching shared state
+- `getCurrentTimestamp()` uses `localtime_r` (POSIX reentrant) rather than `localtime`, which returns a pointer to a static buffer and is not safe to call concurrently from multiple threads
+- `CaptureManager::dissectionSamples` is protected by its own `mutex` since it is written by the capture thread and read by `main` after join
+
+---
+
+## Important Notes
+
+Raw socket access requires elevated permissions:
+```bash
+sudo ./network_monitor
+```
+
+Default interface is `eth0`. Alternatives: `wlan0` (Wi-Fi), `lo` (loopback — useful for testing without external traffic).
+
+---
+
+## Repository
+https://github.com/Ailya-Shah/StackQueueNetwork-Monitor
